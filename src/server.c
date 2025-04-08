@@ -2844,6 +2844,7 @@ void initServer(void) {
         server.db[j].avg_ttl = 0;
     }
     evictionPoolAlloc(); /* Initialize the LRU keys pool. */
+    expirationPoolAlloc();   /* Initialize the expiration pools. */
     /* Note that server.pubsub_channels was chosen to be a kvstore (with only one dict, which
      * seems odd) just to make the code cleaner by making it be the same type as server.pubsubshard_channels
      * (which has to be kvstore), see pubsubtype.serverPubSubChannels */

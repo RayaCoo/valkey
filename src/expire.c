@@ -37,6 +37,69 @@
 
 #include "server.h"
 
+
+/* TODO: comment */
+#define EPPOOL_SIZE 20
+
+/* Define expirationPool as an array of robj */
+typedef robj **expirationPool;
+/* Create an array of expiration pool, one for each database. */
+static expirationPool *ExpirationPools;
+
+void expirationPoolAlloc(void) {
+    int dbnum = server.dbnum;
+
+    ExpirationPools = zmalloc(sizeof(expirationPool) * dbnum);
+
+    for (int i = 0; i < dbnum; i++) {
+        ExpirationPools[i] = zmalloc(sizeof(struct robj*) * EPPOOL_SIZE);
+        for (int j = 0; j < EPPOOL_SIZE; j++) {
+            ExpirationPools[i][j] = NULL;
+        }
+    }
+}
+
+void expirationPoolPopulate(serverDb *db, robj *val) {
+    expirationPool pool = ExpirationPools[db->id];
+    int k;
+
+    /* First check if the key already exists in the pool */
+    for (int i = 0; i < EPPOOL_SIZE; i++) {
+        if (pool[i] && pool[i] == val) {
+            return;  /* Key already exists in the pool, no need to insert again */
+        }
+    }
+
+    k = 0;
+    while (k < EPPOOL_SIZE && pool[k] && objectGetExpire(pool[k]) > objectGetExpire(val)) k++;
+
+    /* If we can't insert (all slots filled with sooner-to-expire entries), return */
+    if (k == 0 && pool[EPPOOL_SIZE - 1] != NULL) {
+        return;
+    } else if (k < EPPOOL_SIZE && pool[k] == NULL) {
+        /* Inserting into empty position. No setup needed before insert. */
+    } else {
+        /* Inserting in the middle. Now k points to the first element
+         * with expire time greater than the element to insert. */
+        if (pool[EPPOOL_SIZE - 1] == NULL) {
+            /* Free space on the right? Insert at k shifting
+             * all the elements from k to end to the right. */
+            memmove(pool + k + 1, pool + k, sizeof(pool[0]) * (EPPOOL_SIZE - k - 1));
+        } else {
+            /* No free space on right? Insert at k-1 */
+            k--;
+            /* Shift all elements on the left of k (included) to the
+             * left, so we discard the element with smallest expire time. */
+            if (pool[0]) decrRefCount(pool[0]);
+            memmove(pool, pool + 1, sizeof(pool[0]) * k);
+        }
+    }
+
+    /* Store the entry and increment its refcount */
+    pool[k] = val;
+    incrRefCount(val);
+}
+
 /*-----------------------------------------------------------------------------
  * Incremental collection of expired keys.
  *
@@ -145,6 +208,9 @@ void expireScanCallback(void *privdata, void *entry) {
         /* We want the average TTL of keys yet not expired. */
         data->ttl_sum += ttl;
         data->ttl_samples++;
+
+        /* Try to add this entry to the expiration pool for future expiration */
+        expirationPoolPopulate(data->db, val);
     }
     data->sampled++;
 }
@@ -252,6 +318,39 @@ void activeExpireCycle(int type) {
 
         if (kvstoreSize(db->expires)) dbs_performed++;
 
+        /* First, try to expire keys from the expire pool */
+        expirationPool pool = ExpirationPools[db->id];
+        long long now = mstime();
+        int expired_from_pool = 0;
+
+        for (int i = EPPOOL_SIZE - 1; i >= 0; i--) {
+            if (pool[i] == NULL) continue;
+            if (objectGetExpire(pool[i]) <= now) {
+                /* Key is expired, try to expire it */
+                if (activeExpireCycleTryExpire(db, pool[i], now)) {
+                    expired_from_pool++;
+                    /* Propagate the DEL command */
+                    postExecutionUnitOperations();
+                }
+                serverLog(LL_NOTICE, "db: %d delete expire key from pool %d times", j, expired_from_pool);
+
+                /* Clean up the pool entry */
+                decrRefCount(pool[i]);
+                pool[i] = NULL;
+            } else {
+                /* Since we're traversing from back to front and keys are sorted by expire time,
+                 * if we find a non-expired key, all keys before it are also not expired */
+                serverLog(LL_NOTICE, "skip");
+                break;
+            }
+        }
+
+        /* If we found expired keys in the pool, update stats */
+        if (expired_from_pool > 0) {
+            total_expired += expired_from_pool;
+            total_sampled += expired_from_pool;
+        }
+
         /* Continue to expire if at the end of the cycle there are still
          * a big percentage of keys to expire, compared to the number of keys
          * we scanned. The percentage, stored in config_cycle_acceptable_stale
@@ -355,6 +454,7 @@ void activeExpireCycle(int type) {
                 }
             }
         } while (repeat);
+        serverLog(LL_NOTICE, "db: %d total delete expire key: %ld", j, total_expired);
     }
 
     elapsed = ustime() - start;

@@ -3555,6 +3555,8 @@ void handleBlockedClientsTimeout(void);
 int clientsCronHandleTimeout(client *c, mstime_t now_ms);
 
 /* expire.c -- Handling of expired keys */
+void expirationPoolAlloc(void);
+void expirationPoolPopulate(serverDb *db, robj *val);
 void activeExpireCycle(int type);
 void expireReplicaKeys(void);
 void rememberReplicaKeyWithExpire(serverDb *db, robj *key);
